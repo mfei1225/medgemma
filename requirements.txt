@@ -1,0 +1,11 @@
+torch>=2.0.0
+transformers>=4.50.0
+accelerate
+bitsandbytes
+fastapi
+uvicorn[standard]
+pillow
+pydantic-settings
+python-multipart
+matplotlib
+scipy
