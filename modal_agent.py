@@ -146,11 +146,25 @@ class MedGemmaPerception:
 
 
     @modal.method()
-    def analyze(self, image_base64: str, task_context: str) -> str:
-        prompt = f"""
-You are a radiology perception model analyzing ONE CT/MRI slice.
+    def analyze(self, images_base64: Any, task_context: str) -> Dict:
+        # Normalize to list
+        if isinstance(images_base64, str):
+            images_base64 = [images_base64]
 
-User Target: "{task_context}"
+        num_slices = len(images_base64)
+        slice_desc = "ONE CT/MRI slice" if num_slices == 1 else f"a stack of {num_slices} CONSECUTIVE CT/MRI slices"
+
+        prompt = f"""
+You are a radiology PERCEPTION model analyzing {slice_desc}.
+Use ONLY what is visible in these images. Do NOT guess from the user text.
+
+USER TARGET TEXT:
+\"\"\"{task_context}\"\"\"
+
+Goal:
+1) Identify plane + coarse anatomic region.
+2) Decide if the target (structure/finding/ROI) is visible in these slices.
+3) If visible, give minimal location cues.
 
 Return ONLY valid JSON. No extra text. No markdown.
 
@@ -158,29 +172,44 @@ Schema:
 {{
   "plane": "Axial|Coronal|Sagittal|Unknown",
   "region_guess": "Brain|Neck|Chest|Upper Abdomen|Mid Abdomen|Pelvis|Lower Extremity|Unknown",
-  "visible_structures": ["... up to 10 short items ..."],
+
+  "target_keywords": ["... up to 3 short phrases copied from the user text ..."],
+
   "target_visible": true|false,
-  "explanation": "1-2 sentences describing ONLY what is visible",
+
+  "target_location": {{
+    "laterality": "Left|Right|Midline|Bilateral|Unknown",
+    "relative_position": "Anterior|Posterior|Central|Peripheral|Unknown"
+  }},
+
+  "visible_structures": ["... up to 5 high-confidence anatomy items ..."],
+
+  "evidence": ["... 1-2 concrete visible cues OR 1-2 concrete reasons not visible ..."],
+
   "confidence": 0.0
 }}
 
-4) explanation MUST be 1–2 sentences:
-   - What you see that supports plane/region (or why Unknown),
-   - and why target_visible is true/false.
-   - If uncertain, explicitly say you are uncertain.
-5) confidence is your confidence in plane+region+target_visible as a whole:
-   - 0.0–0.4 if uncertain
-   - 0.5–0.7 if moderate
-   - 0.8–1.0 only if clear
+STRICT RULES:
+- target_keywords: pick 1–3 key phrases from the user text. If vague, use [].
+- PERCEPTION ONLY: describe only what you can directly see in these images.
+- EVIDENCE GATE (CRITICAL):
+  - You may set target_visible=true ONLY if evidence includes at least ONE concrete visible cue.
+  - If you cannot name a concrete visible cue, target_visible MUST be false.
+- What counts as a “concrete visible cue” (choose the closest that fits what you see):
+  - "focal mass/lesion", "nodule", "abnormal fluid collection/effusion", "free air/gas", "fracture/disruption",
+    "hyperdense blood", "edema/swelling", "fat stranding/inflammation", "dilated bowel/obstruction pattern",
+    "stone/calcification", "enlarged organ", "vascular dilation/aneurysm", "device/tube/line", "abnormal opacity in lung".
+- If region_guess is clearly incompatible with the target_keywords (e.g., brain target but pelvis is shown), set target_visible=false.
+- evidence must NEVER be "none". If not visible, say why (e.g., "target organ not in these slices", "no clear abnormality matching keywords").
+- visible_structures: max 5 items, anatomy only, high confidence.
+- confidence reflects plane+region+target_visible together:
+  0.0–0.4 uncertain, 0.5–0.7 moderate, 0.8–1.0 only if clear.
 
-Rules:
-- Describe ONLY what is strictly visible in THIS slice.
-- visible_structures: MAX 6 items. High-confidence anatomy only.
-- target_visible: false if the region is wrong (e.g., Heart is NOT visible in Mid Abdomen).
-- Do not hallucinate the target simply because the user asked for it.
-- JSON ONLY.
+JSON ONLY.
 """
-        raw = self._generate(image_base64, prompt)
+
+
+        raw = self._generate(images_base64, prompt)
         parsed = extract_first_json(raw)
         if parsed is None:
             return {"ok": False, "raw": raw}
@@ -227,7 +256,6 @@ Write a patient-friendly explanation with these labeled sections:
 6) Key takeaway
 - 1–2 sentences summarizing the most important point.
 
-Length: 120–200 words. No bullet explosions; keep it readable.
 """
         return self._generate(images_base64, prompt)
 
@@ -280,31 +308,30 @@ class GemmaReasoning:
         system_prompt = f"""
 You are a Medical CT/MRI Slice Navigation Agent.
 
-Your ONLY job is to move through slices to locate and clearly visualize the requested target.
+Your ONLY job is to move through slices to locate and clearly visualize the requested USER TARGET.
 
 You are NOT responsible for windowing.
 You MUST NEVER suggest window/level changes.
-You may ONLY scroll or stop.
+You may ONLY scroll slices or stop.
 
 ============================================================
 USER TARGET:
 "{user_request}"
 
 ============================================================
-
-============================================================
 CURRENT PERCEPTION (JSON):
 {perception_text}
-- Current slice: {current_state.get("current_slice")}
+
+CURRENT SLICE STATE:
+- Current slice index: {current_state.get("current_slice")}
 - Total slices: {current_state.get("total_slices")}
 
 ============================================================
-HISTORY:
+HISTORY (most recent last):
 {history}
 
 ============================================================
 BODY REGION ORDER (Cranial → Caudal):
-
 Brain
 Neck
 Chest
@@ -314,9 +341,9 @@ Pelvis
 Lower Extremity
 
 ============================================================
-NAVIGATION RULES
+NAVIGATION RULES (STRICT)
 
-1. STOP CONDITION
+1) STOP CONDITION
 If:
 - target_visible == true
 AND
@@ -328,30 +355,35 @@ You may NOT stop otherwise.
 
 ------------------------------------------------------------
 
-2. REGION MATCH RULE
-If the anatomical region does NOT match the region where the target organ should be located,
+2) REGION MATCH RULE
+If the anatomical region does NOT match where the USER TARGET should be located,
 you MUST scroll toward the correct region.
 
 You may NOT diagnose pathology outside the correct region.
 
 ------------------------------------------------------------
 
-============================================================
-NAVIGATION RULES
+3) SLICE ORIENTATION RULE (CRITICAL)
+Slice direction is DEFINED as:
 
-1. SEMANTIC MOVEMENT:
-   - If target is above (cranial to) current region, use "scroll_cranial".
-   - If target is below (caudal to) current region, use "scroll_caudal".
-   - Do NOT guess the sign. The frontend handles the mapping.
+- Cranial (toward Brain)  = NEGATIVE step
+- Caudal  (toward Pelvis) = POSITIVE step
 
-2. STEP SIZE STRATEGY:
+So:
+- To move cranial: step must be < 0
+- To move caudal:  step must be > 0
 
-2. AVOID OSCILLATION:
-   - Do NOT flip-flop between +30 and -30.
-   - If you moved -30 and got closer (e.g., Abdomen -> Chest), your next step MUST be negative (e.g., -10 or -5) to fine-tune.
-   - Do NOT go back +30.
-orientation direction (index mapping) is uncertain:
-→ Perform small probe scroll of ±3 slices.
+You MUST follow this convention.
+
+------------------------------------------------------------
+
+4) STEP SIZE STRATEGY
+Choose step magnitude based on distance:
+
+- Far away (2+ regions away): step = 30
+- Moderate distance (1 region away): step = 10
+- Close (in correct region but target not visible): step = 3 to 5
+- Fine-tuning: step = 1 to 3
 
 ------------------------------------------------------------
 
@@ -363,34 +395,31 @@ orientation direction (index mapping) is uncertain:
 
 ------------------------------------------------------------
 
-5. ANTI-OSCILLATION & BOUNDARY RULE (CRITICAL)
-- If history says "Hit volume boundary":
-  You MUST reverse direction immediately.
-  (e.g., if you tried to scroll down, now scroll up).
-- If last action did not change region_guess:
-  Reduce step size.
-- If repeated back-and-forth detected:
-  Reduce magnitude and maintain direction.
+6) BOUNDARY RULE (CRITICAL)
+If history says "Hit volume boundary":
+- You MUST reverse direction immediately.
+- Reduce step size to 5 or less.
 
 ------------------------------------------------------------
 
 CRITICAL CONSTRAINTS
-- You MUST output JSON only.
+- Output JSON ONLY.
 - You MUST NEVER output windowing actions.
 - Allowed action types: scroll_delta or null.
 - No explanations outside JSON.
+- No extra keys beyond "thought" and "action".
 
 ============================================================
-
-OUTPUT FORMAT:
+OUTPUT FORMAT (JSON ONLY)
 
 {{
-  "thought": "brief reasoning",
-  "action": 
-      {{ "type": "scroll_delta", "step": <int> }}
-   OR null
+  "thought": "brief reasoning (1 sentence max)",
+  "action": {{ "type": "scroll_delta", "step": <signed int> }}
+  OR
+  "action": null
 }}
 """
+
 
         
         messages = [
@@ -612,7 +641,9 @@ async def check_window_endpoint(request: Request):
 async def perception_endpoint(request: Request):
     data = await request.json()
     model = MedGemmaPerception()
-    analysis = model.analyze.remote(data.get("image_base64"), data.get("text"))
+    # Support both key names: 'images_base64' (list) or 'image_base64' (single/list)
+    imgs = data.get("images_base64") or data.get("image_base64")
+    analysis = model.analyze.remote(imgs, data.get("text"))
     return analysis
 
 
