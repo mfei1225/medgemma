@@ -74,33 +74,64 @@ class MedGemmaModel:
         Stage 1A: WINDOWING AGENT
         Determines if the window/level needs adjustment based on the target tissue.
         """
-        system_prompt = f"""You are the Windowing Logic Module. Based on User input, determine if the window/level needs adjustment to see presented pathology.
-Current State: Window={current_state.get('window_width', 'N/A')} HU, Level={current_state.get('window_center', 'N/A')} HU.
+        system_prompt = f"""
+You are a Medical Imaging VOI (Window/Level) Agent for CT.
 
-Common Presets (Window/Level in HU):
-- Soft Tissue: 400/50 (Default for abdomen/appendicitis)
-- Lung: 1500/-600
-- Bone: 1800/400
-- Brain: 80/40
-- Liver: 150/30
-- Vascular/Angio: 600/200
+Your job: choose a single window width (WW) and window center/level (WC) in Hounsfield Units (HU)
+that best visualizes the PRIMARY target in the user request.
 
-Task:
-1. **Identify Target**: Preset for pathology (e.g. "appendicitis" -> Soft Tissue).
-2. **Calculate Difference**: Compare Current vs Target.
-3. **DECISION**:
-   - IF (Delta Window > 30 OR Delta Level > 30): GENERATE "set_window_level" action.
-   - ELSE: Return empty action {{}}.
+You MUST return an ACTION object that can be executed by a DICOM viewer.
+You are NOT allowed to scroll slices. Only set window/level or do nothing.
 
-Output format (JSON ONLY):
-Example:
+============================================================
+USER REQUEST:
+"{user_request}"
+
+============================================================
+RULES (STRICT):
+1) Output JSON ONLY. No prose, no markdown, no extra keys.
+2) WW and WC MUST be integers in HU.
+3) Choose ONE best preset based on the PRIMARY target.
+4) If multiple targets exist, prefer:
+   a) most clinically urgent (hemorrhage > stroke > fracture > soft tissue),
+   b) otherwise the first explicit target mentioned.
+5) If the request is generic/unclear, default to Soft Tissue (400, 50).
+6) If the request is clearly NOT CT (e.g., MRI-only terms like "T1", "FLAIR") OR the target is not window-dependent,
+   return action = null.
+
+============================================================
+PRESET OPTIONS (WW, WC in HU):
+- Brain: 80, 40
+- Subdural / Hemorrhage: 200, 80
+- Stroke (early ischemia): 40, 40
+- Temporal Bone: 2800, 600
+- Soft Tissue (Abdomen/Chest): 400, 50
+- Lung: 1500, -600
+- Liver: 150, 30
+- Bone: 2000, 500
+- Spine: 1800, 400
+
+============================================================
+TERM MAPPING (examples):
+- "pericardial effusion", "heart", "mediastinum" -> Soft Tissue
+- "lung", "pulmonary", "pleura", "pneumothorax" -> Lung
+- "fracture", "osseous", "rib", "bone" -> Bone
+- "spine", "vertebra", "canal" -> Spine
+- "liver", "hepatic" -> Liver
+- "brain", "head CT" -> Brain
+- "subdural", "ICH", "hemorrhage" -> Subdural
+- "stroke", "acute infarct" -> Stroke
+
+============================================================
+OUTPUT FORMAT (JSON ONLY):
 {{
-  "thought": "Target Soft Tissue (400/50). Current is 329/-172. Delta > 30. MUST adjust.",
-  "action": {{ "type": "set_window_level", "window": 400, "level": 50 }}
+  "thought": "<brief>",
+  "action": {{ "type": "set_window_level", "window": <int>, "level": <int>, "name": "<preset name>" }}
+  OR
+  "action": null
 }}
+"""
 
-**CRITICAL**: Return ONLY a valid JSON object. End with '}}'.
-User input: {text}"""
         return self._run_agent_prompt(system_prompt, image, temp=0.1)
 
     def _plan_scrolling(self, text: str, current_state: dict, image: Optional[Image.Image] = None, previous_action: Optional[dict] = None, previous_thought: str = "") -> Tuple[str, Optional[dict]]:
