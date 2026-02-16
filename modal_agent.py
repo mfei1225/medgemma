@@ -20,13 +20,40 @@ image = (
         "pillow",
         "fastapi",
         "pydantic",
+        "TotalSegmentator",
+        "nibabel",
+        "scipy",
+        "pydicom",
+        "requests",
     )
     # Add environment variable for better memory allocation if needed
     .env({"PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True"})
+    .run_commands("pip install scipy nibabel TotalSegmentator pydicom requests")
 )
 
 # Shared volume for model caching
 model_cache = modal.Volume.from_name("medgemma-cache", create_if_missing=True)
+
+# List of valid TotalSegmentator structures (subset for efficiency/prompting)
+VALID_STRUCTURES = [
+    "spleen", "kidney_right", "kidney_left", "gallbladder", "liver", "stomach", "pancreas",
+    "adrenal_gland_right", "adrenal_gland_left", "lung_upper_lobe_left", "lung_lower_lobe_left",
+    "lung_upper_lobe_right", "lung_middle_lobe_right", "lung_lower_lobe_right", "esophagus",
+    "trachea", "thyroid_gland", "small_bowel", "duodenum", "colon", "urinary_bladder",
+    "prostate", "kidney_cyst_left", "kidney_cyst_right", "sacrum", "vertebrae_L5", "vertebrae_L4",
+    "vertebrae_L3", "vertebrae_L2", "vertebrae_L1", "vertebrae_T12", "vertebrae_T11", "vertebrae_T10",
+    "vertebrae_T9", "vertebrae_T8", "vertebrae_T7", "vertebrae_T6", "vertebrae_T5", "vertebrae_T4",
+    "vertebrae_T3", "vertebrae_T2", "vertebrae_T1", "vertebrae_C7", "vertebrae_C6", "vertebrae_C5",
+    "vertebrae_C4", "vertebrae_C3", "vertebrae_C2", "vertebrae_C1", "heart", "aorta", "pulmonary_vein",
+    "brachiocephalic_trunk", "subclavian_artery_right", "subclavian_artery_left", "common_carotid_artery_right",
+    "common_carotid_artery_left", "brachiocephalic_vein_left", "brachiocephalic_vein_right", "atrial_appendage_left",
+    "superior_vena_cava", "inferior_vena_cava", "portal_vein_and_splenic_vein", "iliac_artery_left",
+    "iliac_artery_right", "iliac_vena_left", "iliac_vena_right", "humerus_left", "humerus_right",
+    "scapula_left", "scapula_right", "clavicula_left", "clavicula_right", "femur_left", "femur_right",
+    "hip_left", "hip_right", "spinal_cord", "gluteus_maximus_left", "gluteus_maximus_right",
+    "gluteus_medius_left", "gluteus_medius_right", "gluteus_minimus_left", "gluteus_minimus_right",
+    "autochthon_left", "autochthon_right", "iliopsoas_left", "iliopsoas_right", "brain", "skull"
+]
 def extract_first_json(text: str):
     start = text.find("{")
     if start == -1:
@@ -49,17 +76,6 @@ def extract_first_json(text: str):
 PERCEPTION_GPU = "A10G"
 # Reasoning (27B) needs 80GB A100 to avoid loading OOM (failed on 40GB).
 REASONING_GPU = "A100-80GB"
-
-def expected_regions_for_target(task_context: str):
-    t = (task_context or "").lower()
-    # very small ruleset—add more over time
-    if "pericard" in t or "heart" in t or "cardiac" in t or "effusion" in t:
-        return {"Chest"}
-    if "brain" in t or "intracran" in t or "subdural" in t or "ich" in t:
-        return {"Brain"}
-    if "pelvis" in t or "bladder" in t or "prostate" in t or "uterus" in t:
-        return {"Pelvis"}
-    return None
 
 @app.cls(
     image=image,
@@ -108,6 +124,15 @@ class MedGemmaPerception:
             image_bytes = base64.b64decode(img_b64)
             pil_image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
             pil_images.append(pil_image)
+
+        # DEBUG: Log image stats
+        import numpy as np
+        if pil_images:
+            first_img = np.array(pil_images[0])
+            print(f"Received {len(pil_images)} images. Size: {pil_images[0].size}")
+            print(f"Img[0] stats: Mean={first_img.mean():.2f}, Std={first_img.std():.2f}, Min={first_img.min()}, Max={first_img.max()}")
+            if first_img.mean() < 5:
+                print("WARNING: Image seems very dark/black!")
 
         # Build content with multiple images
         content = []
@@ -387,15 +412,7 @@ Choose step magnitude based on distance:
 
 ------------------------------------------------------------
 
-4. STEP SIZE STRATEGY
-- Large distance (far region) → step 30
-- Moderate distance → step 10
-- Close to expected region → step 3–5
-- If near boundaries → reduce step size
-
-------------------------------------------------------------
-
-6) BOUNDARY RULE (CRITICAL)
+5) BOUNDARY RULE (CRITICAL)
 If history says "Hit volume boundary":
 - You MUST reverse direction immediately.
 - Reduce step size to 5 or less.
@@ -405,7 +422,7 @@ If history says "Hit volume boundary":
 CRITICAL CONSTRAINTS
 - Output JSON ONLY.
 - You MUST NEVER output windowing actions.
-- Allowed action types: scroll_delta or null.
+- Allowed action types: `scroll_delta` or `segment_structure` or `null`.
 - No explanations outside JSON.
 - No extra keys beyond "thought" and "action".
 
@@ -415,6 +432,8 @@ OUTPUT FORMAT (JSON ONLY)
 {{
   "thought": "brief reasoning (1 sentence max)",
   "action": {{ "type": "scroll_delta", "step": <signed int> }}
+  OR
+  "action": {{ "type": "segment_structure", "structure": "<valid_structure_name>" }}
   OR
   "action": null
 }}
@@ -591,6 +610,7 @@ OUTPUT FORMAT (JSON ONLY):
         print(f"--- WINDOW AGENT OUTPUT ---\n{generated_text}\n---------------------------")
         
         # Parse JSON and force the {thought, action} wrapper
+
         try:
             match = re.search(r'\{.*\}', generated_text, re.DOTALL)
             if match:
@@ -605,7 +625,450 @@ OUTPUT FORMAT (JSON ONLY):
             else:
                 return {"thought": "No JSON found in model output.", "action": None}
         except Exception as e:
-             return {"thought": f"Error parsing window suggestion: {e}", "action": None}
+            return {"thought": f"Error parsing window suggestion: {e}", "action": None}
+
+    @modal.method()
+    def identify_structure(self, user_text: str) -> Dict[str, Any]:
+        """
+        Maps user text (pathology/finding) to a valid TotalSegmentator structure.
+        Returns: { "structure": "name" or None, "thought": "reasoning" }
+        """
+        import torch
+        import json
+        import re
+
+        system_prompt = f"""
+You are a Medical Query Router.
+Your job is to map a user's request (pathology, organ, or finding) to a SINGLE anatomical structure from the valid list below.
+
+VALID STRUCTURES:
+[""" + ", ".join(VALID_STRUCTURES) + """]
+
+RULES:
+1. If the user mentions a specific organ (e.g. "liver", "spleen"), return that structure.
+2. If the user mentions a pathology (e.g. "kidney cyst", "tumor in lung"), map it to the specific structure if available (e.g. "kidney_cyst_left") OR the container organ (e.g. "lung_upper_lobe_left").
+3. If specific laterality (left/right) is NOT mentioned but required, return the base organ or both if possible? No, pick the most likely or generic one.
+   - Actually, if "kidney cyst" (unspecified), return "kidney_right" (as a proxy) OR "kidney_cyst_right" (random guess) OR try to find a generic.
+   - Better: Return "kidney_right" and if that fails, the agent can try left?
+   - Instruction: If laterality is ambiguous, pick RIGHT side by default or the most common variant.
+4. If the entity is NOT in the list (e.g. "appendicitis" but "appendix" is not listed), map to the closest landmark (e.g. "cecum" or "colon").
+5. If NO relevant structure is found, return null.
+
+OUTPUT JSON ONLY:
+{{
+  "thought": "brief reasoning",
+  "structure": "valid_structure_name" OR null
+}}
+"""
+        messages = [
+            {"role": "user", "content": f"User Request: \"{user_text}\"\n\n{system_prompt}"}
+        ]
+
+        encodeds = self.tokenizer.apply_chat_template(messages, return_tensors="pt", add_generation_prompt=True)
+        if isinstance(encodeds, dict) or hasattr(encodeds, 'keys'):
+             input_ids = encodeds["input_ids"]
+        else:
+             input_ids = encodeds
+        input_ids = input_ids.to(next(self.model.parameters()).device)
+
+        with torch.no_grad():
+            outputs = self.model.generate(
+                input_ids=input_ids,
+                max_new_tokens=200,
+                do_sample=False,
+            )
+        
+        generated_text = self.tokenizer.decode(outputs[0][input_ids.shape[1]:], skip_special_tokens=True)
+        
+        try:
+            parsed = extract_first_json(generated_text)
+            if parsed and "structure" in parsed:
+                return parsed
+            return {"thought": generated_text, "structure": None}
+        except:
+            return {"thought": "Failed to parse", "structure": None}
+
+
+@app.cls(
+    image=image,
+    gpu="A10G",
+    volumes={"/cache": model_cache},
+    secrets=[modal.Secret.from_name("huggingface-secret")],
+    timeout=600,
+    cpu=4,
+    memory=16384,
+)
+class SegmentationAgent:
+    @modal.method()
+    def get_centroid(self, contrast_nifti_path: str, structure_name: str) -> Dict[str, Any]:
+        """
+        Runs TotalSegmentator on the provided NIfTI file for the specific structure
+        and returns the centroid (x, y, z).
+        Note: contrast_nifti_path should be a path in the container (e.g. /tmp/...).
+        However, since we pass data via Modal, we might need to handle bytes or mount a volume.
+        For simplicity, I'll assume we pass the image data as base64 or similar, BUT
+        TotalSegmentator works on files. Best to write to a temp file.
+        """
+        import os
+        import nibabel as nib
+        import numpy as np
+        from totalsegmentator.python_api import totalsegmentator
+        from scipy.ndimage import center_of_mass
+        import tempfile
+
+        if structure_name not in VALID_STRUCTURES:
+            return {"error": f"Structure '{structure_name}' not supported."}
+
+        # For now, let's assume the input is a path to a file already in the volume or similar.
+        # But wait, the frontend sends slices. Reconstructing a 3D volume from slices in base64
+        # is heavy. 
+        # Ideally, `contrast_nifti_path` refers to a file that we can access.
+        # IF the frontend sends a stack of images, we need to stack them.
+        
+        # simplified for this step: assumes we can just import logic
+        # Implementation details will depend on how we get the 3D volume.
+        
+        pass
+
+    @modal.method()
+    def get_centroid_from_bytes(self, nifti_bytes: bytes, structure_name: str) -> Dict[str, Any]:
+        import os
+        import nibabel as nib
+        import numpy as np
+        from totalsegmentator.python_api import totalsegmentator
+        from scipy.ndimage import center_of_mass
+        import tempfile
+
+        if structure_name not in VALID_STRUCTURES:
+             return {"error": f"Structure '{structure_name}' not supported."}
+
+        with tempfile.NamedTemporaryFile(suffix=".nii.gz", delete=False) as tmp_in:
+            tmp_in.write(nifti_bytes)
+            input_path = tmp_in.name
+            
+        output_path = input_path.replace(".nii.gz", "_seg.nii.gz")
+        
+        try:
+            # Run Segmentation (Fast -> Normal retry)
+            success = self._run_segmentation(input_path, output_path, structure_name)
+            
+            if not success:
+                 return {"found": False, "centroid": None, "message": "Structure not found (segmentation failed or empty)."}
+
+            img = nib.load(output_path)
+            data = img.get_fdata()
+            com_voxel = center_of_mass(data)
+            
+            return {
+                "found": True,
+                "centroid_voxel": com_voxel, 
+                "structure": structure_name
+            }
+            
+        except Exception as e:
+            return {"error": str(e)}
+        finally:
+            if os.path.exists(input_path):
+                os.remove(input_path)
+            if os.path.exists(output_path):
+                os.remove(output_path)
+
+    @modal.method()
+    def get_centroid_from_raw(self, volume_bytes: bytes, metadata: Dict, structure_name: str) -> Dict[str, Any]:
+        """
+        Creates a NIfTI from raw bytes and metadata, then segments.
+        metadata: {rows, columns, slices, spacing: [row_spacing, col_spacing, slice_thickness]}
+        """
+        import os
+        import nibabel as nib
+        import numpy as np
+        from totalsegmentator.python_api import totalsegmentator
+        from scipy.ndimage import center_of_mass
+        import tempfile
+
+        if structure_name not in VALID_STRUCTURES:
+             return {"error": f"Structure '{structure_name}' not supported."}
+
+        # 1. Reconstruct Numpy Array
+        # Assuming Int16 (common for CT)
+        # Note: JavaScript sent it as a flat sequence of Int16s
+        # We need to reshape it.
+        try:
+            arr = np.frombuffer(volume_bytes, dtype=np.int16)
+            
+            rows = metadata.get("rows")
+            cols = metadata.get("columns")
+            slices = metadata.get("slices")
+            
+            if len(arr) != rows * cols * slices:
+                 # Try Float32?
+                 return {"error": f"Data size mismatch. Expected {rows*cols*slices}, got {len(arr)}"}
+            
+            # Reshape to (rows, cols, slices) -> (x, y, z)
+            # DICOM pixel data is usually (rows, cols). Stack is (rows, cols, slices).
+            # BUT: Nibabel expects (x, y, z).
+            # If we just reshape to (rows, cols, slices), that's usually correct for NIfTI if we set affine right.
+            # But let's assume standard orientation for now.
+            volume_data = arr.reshape((rows, cols, slices), order='F') # 'F' for column-major? JS is row-major usually?
+            # JS flat array: [row0, row1...] -> this is 'C' order (row-major).
+            volume_data = arr.reshape((rows, cols, slices), order='C')
+            
+            # However, prompt says "volumeData.set(pixelData, i * rows * columns)".
+            # pixelData is usually row-major.
+            # So the flat buffer is slice0_row0, slice0_row1... slice1_row0...
+            # This is (slices, rows, cols) in C order if we look at it that way?
+            # Wait, JS loop: loadedImages.forEach((img, i) => ... set at i*rows*cols)
+            # So the outer dimension is slices.
+            # So the flat array is [slice0, slice1, slice2...]
+            # Inside a slice: [row0, row1...]
+            # So it is (slices, rows, cols).
+            
+            volume_data = arr.reshape((slices, rows, cols), order='C')
+            
+            # Nibabel expects (x, y, z) usually (rows, cols, slices) equivalent?
+            # It depends on affine.
+            # Let's transpose to (rows, cols, slices) which is (y, x, z)? Or (x, y, z).
+            # Let's try (cols, rows, slices) = (x, y, z).
+            # Usually DICOM images are (rows, cols).
+            # Let's swap axes to get (rows, cols, slices).
+            volume_data = np.transpose(volume_data, (1, 2, 0))
+            
+            # 2. Create NIfTI image
+            # Simple identity affine with scaling
+            spacing = metadata.get("spacing", [1.0, 1.0, 1.0])
+            affine = np.diag(spacing + [1.0])
+            
+            nifti_img = nib.Nifti1Image(volume_data, affine)
+            
+        except Exception as e:
+            return {"error": f"Failed to reconstruct NIfTI: {e}"}
+
+        # 3. Save to temp
+        with tempfile.NamedTemporaryFile(suffix=".nii.gz", delete=False) as tmp_in:
+            nib.save(nifti_img, tmp_in.name)
+            input_path = tmp_in.name
+            
+        output_path = input_path.replace(".nii.gz", "_seg.nii.gz")
+        
+        try:
+            # Run Segmentation (Fast -> Normal retry)
+            success = self._run_segmentation(input_path, output_path, structure_name)
+            
+            if not success:
+                 return {"found": False, "centroid": None, "message": "Structure not found (segmentation failed or empty)."}
+
+            img = nib.load(output_path)
+            data = img.get_fdata()
+            com_voxel = center_of_mass(data)
+            
+            # Coordinate Transform: Mask Voxel -> World -> Input Voxel
+            # 1. Mask Voxel to World
+            com_world = nib.affines.apply_affine(img.affine, com_voxel)
+            
+            # 2. World to Input Voxel
+            com_input_voxel = nib.affines.apply_affine(np.linalg.inv(nifti_img.affine), com_world)
+            
+            return {
+                "found": True,
+                "centroid_voxel": com_input_voxel.tolist(), 
+                "structure": structure_name
+            }
+            
+        except Exception as e:
+            return {"error": str(e)}
+        finally:
+            if os.path.exists(input_path):
+                os.remove(input_path)
+            if os.path.exists(output_path):
+                os.remove(output_path)
+
+    @modal.method()
+    def get_centroid_from_dicom_urls(self, dicom_urls: list[str], structure_name: str) -> Dict[str, Any]:
+        """
+        Downloads DICOMs from URLs in parallel, stacks them, converts to NIfTI, and segments.
+        Fastest method for cloud-to-cloud transfers.
+        """
+        import os
+        import nibabel as nib
+        import numpy as np
+        import pydicom
+        import requests
+        import io
+        import concurrent.futures
+        import tempfile
+        from scipy.ndimage import center_of_mass
+
+        if structure_name not in VALID_STRUCTURES:
+             return {"error": f"Structure '{structure_name}' not supported."}
+
+        print(f"Downloading {len(dicom_urls)} DICOMs in parallel...")
+
+        def download_dicom(url, index):
+            try:
+                # Handle potentially missing protocol or dicomweb: prefix
+                clean_url = url
+                if clean_url.startswith("dicomweb:"):
+                    clean_url = clean_url.replace("dicomweb:", "")
+                
+                resp = requests.get(clean_url, timeout=10)
+                if resp.status_code != 200:
+                    print(f"Failed to download {url}: {resp.status_code}")
+                    return None
+                
+                ds = pydicom.dcmread(io.BytesIO(resp.content))
+                return (index, ds)
+            except Exception as e:
+                print(f"Error downloading {url}: {e}")
+                return None
+
+        # Download in parallel
+        slices = []
+        with concurrent.futures.ThreadPoolExecutor(max_workers=20) as executor:
+            # Pass index to preserve order if needed, though we should likely sort by InstanceNumber/ImagePosition
+            futures = [executor.submit(download_dicom, url, i) for i, url in enumerate(dicom_urls)]
+            for future in concurrent.futures.as_completed(futures):
+                res = future.result()
+                if res:
+                    slices.append(res)
+        
+        if not slices:
+            return {"error": "Failed to download any DICOM files."}
+
+        # Sort by index (URL order) - assumption: URLs are sorted
+        # Or better: sort by InstanceNumber if available
+        # Let's try to sort by InstanceNumber first, falling back to index
+        try:
+            slices.sort(key=lambda x: int(x[1].InstanceNumber))
+        except:
+            print("InstanceNumber sorting failed, using URL order.")
+            slices.sort(key=lambda x: x[0])
+
+        sorted_ds = [s[1] for s in slices]
+        
+        # Stack into 3D volume
+        # Expecting (rows, cols) pixel data
+        try:
+            # Check PixelData type
+            # pydicom .pixel_array handles types
+            first_ds = sorted_ds[0]
+            rows = first_ds.Rows
+            cols = first_ds.Columns
+            
+            # Stack: (slices, rows, cols)
+            volume = np.stack([ds.pixel_array for ds in sorted_ds])
+            
+            # Convert to (rows, cols, slices) => (y, x, z) or (x, y, z)?
+            # Nibabel usually wants (x, y, z). 
+            # Dicom pixel_array is (y, x) [rows, cols].
+            # So volume is (z, y, x).
+            # We want (x, y, z).
+            # Transpose (2, 1, 0) -> (x, y, z)
+            volume_nifti_orient = np.transpose(volume, (2, 1, 0))
+            
+            # Create Affine
+            # We need PixelSpacing and SliceThickness/ImagePosition
+            ps = first_ds.PixelSpacing # [row, col] -> [y, x]
+            # Spacing vector for affine: [x, y, z]
+            # x_spacing = ps[1]
+            # y_spacing = ps[0]
+            # z_spacing: Calc from ImagePosition (z-diff)
+            
+            try:
+                z_spacing = abs(sorted_ds[1].ImagePositionPatient[2] - sorted_ds[0].ImagePositionPatient[2])
+            except:
+                z_spacing = first_ds.SliceThickness if hasattr(first_ds, 'SliceThickness') else 1.0
+                
+            affine = np.diag([ps[1], ps[0], z_spacing, 1.0])
+            
+            nifti_img = nib.Nifti1Image(volume_nifti_orient, affine)
+            
+        except Exception as e:
+            return {"error": f"Failed to stack/convert DICOMs: {e}"}
+
+        # Save and Segment
+        with tempfile.NamedTemporaryFile(suffix=".nii.gz", delete=False) as tmp_in:
+             nib.save(nifti_img, tmp_in.name)
+             input_path = tmp_in.name
+             
+        output_path = input_path.replace(".nii.gz", "_seg.nii.gz")
+        
+        try:
+            success = self._run_segmentation(input_path, output_path, structure_name)
+            
+            if not success:
+                 return {"found": False, "centroid": None, "message": "Structure not found."}
+
+            img = nib.load(output_path)
+            data = img.get_fdata()
+            com_voxel = center_of_mass(data)
+            
+            # Coordinate Transform: Mask Voxel -> World -> Input Voxel
+            # This ensures correctness even if mask is lower resolution (fast mode)
+            # 1. Mask Voxel to World
+            com_world = nib.affines.apply_affine(img.affine, com_voxel)
+            
+            # 2. World to Input Voxel
+            # We use nifti_img.affine (from input) to map world back to input voxel space
+            com_input_voxel = nib.affines.apply_affine(np.linalg.inv(nifti_img.affine), com_world)
+            
+            # RLE Encode Mask for Frontend Overlay
+            mask_binary = (data > 0).astype(np.uint8)
+            f = mask_binary.flatten()
+            f_padded = np.concatenate([[0], f, [0]])
+            runs = np.where(f_padded[1:] != f_padded[:-1])[0] + 1
+            runs[1::2] -= runs[::2] # Lengths
+            
+
+            return {
+                "found": True,
+                "centroid_voxel": com_input_voxel.tolist(), 
+                "structure": structure_name,
+                "mask_rle": runs.tolist(),
+                "shape": mask_binary.shape,
+                "affine": img.affine.tolist(),
+            }
+        except Exception as e:
+            return {"error": str(e)}
+        finally:
+            if os.path.exists(input_path): os.remove(input_path)
+            if os.path.exists(output_path): os.remove(output_path)
+
+    def _run_segmentation(self, input_path, output_path, structure_name):
+        from totalsegmentator.python_api import totalsegmentator
+        import nibabel as nib
+        import numpy as np
+        
+        # Try Fast mode first
+        print(f"Attempting FAST segmentation for {structure_name}...")
+        try:
+            totalsegmentator(input_path, output_path, roi_subset=[structure_name], fast=True, ml=True)
+            if os.path.exists(output_path):
+                img = nib.load(output_path)
+                if np.sum(img.get_fdata()) > 0:
+                    print("FAST segmentation successful.")
+                    return True
+                # If existing but empty, we might want to retry normal mode?
+                # TotalSegmentator fast mode is usually adequate, but if it misses, normal might find it.
+                print("FAST segmentation produced empty mask. Retrying in NORMAL mode...")
+        except Exception as e:
+            print(f"FAST segmentation failed: {e}. Retrying in NORMAL mode...")
+            
+        # Retry Normal mode
+        try:
+            if os.path.exists(output_path): os.remove(output_path)
+            totalsegmentator(input_path, output_path, roi_subset=[structure_name], fast=False, ml=True)
+            if os.path.exists(output_path):
+                img = nib.load(output_path)
+                if np.sum(img.get_fdata()) > 0:
+                    print("NORMAL segmentation successful.")
+                    return True
+        except Exception as e:
+             print(f"NORMAL segmentation failed: {e}")
+             
+        return False
+
+
+
 
 # --- Separate Endpoints for Frontend Orchestration ---
 
@@ -629,6 +1092,77 @@ async def log_requests(request: Request, call_next):
     print(f"Response status: {response.status_code}")
     return response
 
+@web_app.post("/segment_dicom")
+async def segment_dicom_endpoint(request: Request):
+    """
+    Accepts list of DICOM URLs and a structure name.
+    Downloads, stacks, and segments.
+    """
+    data = await request.json()
+    dicom_urls = data.get("dicom_urls", [])
+    structure = data.get("structure")
+    
+    if not dicom_urls or not structure:
+        return {"error": "Missing dicom_urls or structure"}
+        
+    model = SegmentationAgent()
+    return model.get_centroid_from_dicom_urls.remote(dicom_urls, structure)
+
+@web_app.post("/segment_dicom")
+async def segment_dicom_endpoint(request: Request):
+    """
+    Accepts list of DICOM URLs and a structure name.
+    Downloads, stacks, segments, and determines windowing via LLM.
+    """
+    import asyncio # Local import
+    
+    data = await request.json()
+    dicom_urls = data.get("dicom_urls", [])
+    structure = data.get("structure")
+    
+    if not dicom_urls or not structure:
+        return {"error": "Missing dicom_urls or structure"}
+        
+    seg_model = SegmentationAgent()
+    reasoning_model = GemmaReasoning()
+    
+    # Parallel execution of Segmentation and Window Reasoning
+    try:
+        prompt = f"Show me the {structure}"
+        results = await asyncio.gather(
+            seg_model.get_centroid_from_dicom_urls.remote.aio(dicom_urls, structure),
+            reasoning_model.suggest_window.remote.aio(prompt),
+            return_exceptions=True
+        )
+        
+        seg_result = results[0]
+        window_result = results[1]
+        
+        # Check segmentation success
+        if isinstance(seg_result, Exception):
+            print(f"Segmentation failed: {seg_result}")
+            return {"error": str(seg_result)}
+            
+        if seg_result.get("found"):
+            # Try to apply LLM windowing
+            if (not isinstance(window_result, Exception) and 
+                window_result and 
+                window_result.get("action") and 
+                window_result["action"].get("window") is not None):
+                
+                print(f"Applying LLM Windowing: {window_result['action']}")
+                seg_result["window_level"] = window_result["action"]
+                seg_result["window_thought"] = window_result.get("thought")
+            else:
+                print(f"LLM Windowing failed or yielded no action: {window_result}")
+                # Fallback to hardcoded window_level if it exists in seg_result
+        
+        return seg_result
+        
+    except Exception as e:
+        print(f"Endpoint error: {e}")
+        return {"error": f"Endpoint error: {e}"}
+
 @web_app.post("/check-window")
 async def check_window_endpoint(request: Request):
     data = await request.json()
@@ -636,6 +1170,15 @@ async def check_window_endpoint(request: Request):
     # Now returns object with { "thought": ..., "action": ... }
     result = model.suggest_window.remote(data.get("text"))
     return result
+
+@web_app.post("/identify_structure")
+async def identify_structure_endpoint(request: Request):
+    data = await request.json()
+    text = data.get("text")
+    if not text: return {"structure": None}
+    
+    model = GemmaReasoning()
+    return model.identify_structure.remote(text)
 
 @web_app.post("/perception")
 async def perception_endpoint(request: Request):
@@ -692,6 +1235,64 @@ async def chat_endpoint(request: Request):
 async def summary_multi_endpoint(request: Request):
     """Alias for summarize to support explicit multi-slice calls."""
     return await summarize_endpoint(request)
+
+@web_app.post("/segment_centroid")
+async def segment_centroid_endpoint(request: Request):
+    """
+    Endpoint to get the centroid of a structure.
+    Expects JSON: { "nifti_bytes_base64": "...", "structure": "liver" }
+    """
+    import base64
+    data = await request.json()
+    model = SegmentationAgent()
+    
+    b64_data = data.get("nifti_bytes_base64")
+    if not b64_data:
+        return {"error": "Missing nifti_bytes_base64"}
+        
+    structure = data.get("structure")
+    
+    # Decode base64
+    try:
+        if "," in b64_data:
+            b64_data = b64_data.split(",")[1]
+        file_bytes = base64.b64decode(b64_data)
+    except Exception as e:
+        return {"error": f"Invalid base64: {str(e)}"}
+        
+    return model.get_centroid_from_bytes.remote(file_bytes, structure)
+
+@web_app.post("/segment_raw")
+async def segment_raw_endpoint(request: Request):
+    """
+    Endpoint to get centroid from raw volume data.
+    Expects JSON: { "volume_base64": "...", "metadata": {...}, "structure": "..." }
+    """
+    import base64
+    data = await request.json()
+    model = SegmentationAgent()
+    
+    b64_data = data.get("volume_base64")
+    if not b64_data:
+        return {"error": "Missing volume_base64"}
+        
+    metadata = data.get("metadata")
+    structure = data.get("structure")
+    
+    # Decode
+    try:
+        # It's raw binary data of Int16s
+        # JS btoa might have encoding issues if we just did binary string?
+        # But we did: new Uint8Array(buffer).reduce... String.fromCharCode
+        # That creates a binary string. btoa works on that.
+        # Python base64.b64decode should work.
+        volume_bytes = base64.b64decode(b64_data)
+    except Exception as e:
+        return {"error": f"Invalid base64: {str(e)}"}
+        
+    return model.get_centroid_from_raw.remote(volume_bytes, metadata, structure)
+
+
 
 @app.function(image=image, secrets=[modal.Secret.from_name("huggingface-secret")], timeout=600)
 @modal.asgi_app()
