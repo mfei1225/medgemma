@@ -32,7 +32,7 @@ Backend API for running Google's MedGemma 1.5 model locally and on Modal serverl
 ### 1. Install Dependencies
 
 ```bash
-cd backend
+cd medgemma
 pip install -r requirements.txt
 ```
 
@@ -198,7 +198,7 @@ USE_QUANTIZATION=true
 ## Project Structure
 
 ```
-backend/
+medgemma/
 ├── config.py           # Configuration management
 ├── model.py            # MedGemma model handler
 ├── main.py             # FastAPI application

@@ -1,8 +1,7 @@
-
 import modal
 import os
 from typing import Optional, Dict, Any, List
-from common import app, image, model_cache, VALID_STRUCTURES
+from common import app, image, model_cache, get_modality, get_valid_structures_for_modality
 
 @app.cls(
     image=image,
@@ -10,192 +9,254 @@ from common import app, image, model_cache, VALID_STRUCTURES
     volumes={"/cache": model_cache},
     secrets=[modal.Secret.from_name("huggingface-secret")],
     timeout=600,
+    scaledown_window=300,
     cpu=4,
     memory=16384,
 )
+
+#A100-40GB
+
 class SegmentationAgent:
+
+    @modal.enter()
+    def preload_models(self):
+        """Pre-warm TotalSegmentator models on container start to avoid cold-start latency."""
+        try:
+            from totalsegmentator.libs import download_pretrained_weights
+            download_pretrained_weights(task="total")
+            download_pretrained_weights(task="total_mr")
+            print("TotalSegmentator models pre-loaded.")
+        except Exception as e:
+            print(f"Model pre-load warning (non-fatal): {e}")
+
     @modal.method()
-    def get_centroid_from_dicom_urls(self, dicom_urls: list[str], structure_name: str, modality: Optional[str] = None) -> Dict[str, Any]:
+    def get_centroid_from_dicom_urls(
+        self,
+        dicom_urls: list[str],
+        structure_names: list[str],
+        modality: Optional[str] = None,
+        orientation: Optional[str] = None,
+        fast_mode: bool = True,
+        fallback_to_normal: bool = True,
+    ) -> Dict[str, Any]:
         """
-        Downloads DICOMs from URLs in parallel, stacks them, converts to NIfTI, and segments.
-        Fastest method for cloud-to-cloud transfers.
+        Downloads DICOMs, converts to NIfTI, segments one or more structures
+        in a single TotalSegmentator pass, and returns per-structure RLE masks.
         """
-        import os
+        import asyncio
+        import io
+        import tempfile
+        import shutil
+
+        import httpx
         import nibabel as nib
         import numpy as np
         import pydicom
-        import requests
-        import io
-        import concurrent.futures
-        import tempfile
-        import shutil
-        import dicom2nifti
+        import dicom2nifti.convert_dicom as convert_dicom
         from scipy.ndimage import center_of_mass
-        
-        # If modality is passed as "MRI", normalize to "MR" for consistency
-        if modality and modality.upper() in ["MRI", "MR"]:
-            modality = "MR"
-        elif modality and modality.upper() == "CT":
-            modality = "CT"
-        else:
-            modality = None # Let detection handle it if invalid/unknown
 
-        if structure_name not in VALID_STRUCTURES:
-             return {"error": f"Structure '{structure_name}' not supported."}
+        if not structure_names:
+            return {"error": "No structure names provided."}
 
-        def download_dicom(url, index):
-            try:
-                # Handle potentially missing protocol or dicomweb: prefix
-                clean_url = url
-                if clean_url.startswith("dicomweb:"):
-                    clean_url = clean_url.replace("dicomweb:", "")
-                
-                resp = requests.get(clean_url, timeout=10)
-                if resp.status_code != 200:
-                    print(f"Failed to download {url}: {resp.status_code}")
-                    return None
-                
-                ds = pydicom.dcmread(io.BytesIO(resp.content))
-                return (index, ds)
-            except Exception as e:
-                print(f"Error downloading {url}: {e}")
-                return None
-        datasets_with_idx = []
-        with concurrent.futures.ThreadPoolExecutor(max_workers=10) as exe:
-            futures = [exe.submit(download_dicom, u, i) for i, u in enumerate(dicom_urls)]
-            for f in concurrent.futures.as_completed(futures):
-                res = f.result()
-                if res: datasets_with_idx.append(res)
-        
+        # Normalize modality
+        if modality:
+            upper = modality.upper()
+            if upper in ("MRI", "MR"):
+                modality = "MR"
+            elif upper == "CT":
+                modality = "CT"
+            else:
+                modality = None
+
+        # ── 1. Async download ──────────────────────────────────────────────────
+        async def fetch_all(urls):
+            async with httpx.AsyncClient(timeout=15) as client:
+                async def fetch(url, index):
+                    clean = url.replace("dicomweb:", "") if url.startswith("dicomweb:") else url
+                    try:
+                        resp = await client.get(clean)
+                        if resp.status_code != 200:
+                            print(f"Failed {url}: {resp.status_code}")
+                            return None
+                        ds = pydicom.dcmread(io.BytesIO(resp.content))
+                        return (index, ds)
+                    except Exception as e:
+                        print(f"Error downloading {url}: {e}")
+                        return None
+
+                results = await asyncio.gather(*[fetch(u, i) for i, u in enumerate(urls)])
+                return [r for r in results if r is not None]
+
+        datasets_with_idx = asyncio.run(fetch_all(dicom_urls))
+
         if not datasets_with_idx:
-             return {"error": "Failed to download any DICOMs."}
+            return {"error": "Failed to download any DICOMs."}
 
-        # Sort by index (preserves original order)
         datasets_with_idx.sort(key=lambda x: x[0])
         sorted_ds = [x[1] for x in datasets_with_idx]
 
-        # Use temporary directory for dicom2nifti
-        tmp_dir = tempfile.mkdtemp()
-        dcm_dir = os.path.join(tmp_dir, "dcms")
-        os.makedirs(dcm_dir)
-        
-        for i, ds in enumerate(sorted_ds):
-            ds.save_as(os.path.join(dcm_dir, f"slice_{i:03d}.dcm"))
-            
-        nifti_tmp = os.path.join(tmp_dir, "input.nii.gz")
-        output_path = os.path.join(tmp_dir, "seg.nii.gz")
+        # ── 2. Detect modality ─────────────────────────────────────────────────
+        if modality:
+            scan_modality = modality
+            print(f"Using explicit modality override: {scan_modality}")
+        else:
+            scan_modality = "CT"
+            try:
+                mod = sorted_ds[0].get("Modality", "CT")
+                if "MR" in mod:
+                    scan_modality = "MR"
+            except Exception:
+                pass
+            print(f"Detected modality: {scan_modality}")
 
-        # Convert to NIfTI
+        valid = get_valid_structures_for_modality(scan_modality)
+        structure_names = [s for s in structure_names if s in valid]
+        if not structure_names:
+            return {"error": "None of the requested structures are supported for this modality."}
+
+        # ── 3. Detect orientation if not provided ──────────────────────────────
+        scan_orientation = orientation if orientation else "axial"
+        if not orientation:
+            try:
+                ds = sorted_ds[0]
+                iop = ds.get("ImageOrientationPatient")
+                if iop and len(iop) == 6:
+                    row_dir = np.array([float(iop[0]), float(iop[1]), float(iop[2])])
+                    col_dir = np.array([float(iop[3]), float(iop[4]), float(iop[5])])
+                    normal = np.cross(row_dir, col_dir)
+                    normal = normal / (np.linalg.norm(normal) + 1e-10)
+                    abs_normal = np.abs(normal)
+                    max_idx = np.argmax(abs_normal)
+                    if max_idx == 1:
+                        scan_orientation = "coronal"
+                    elif max_idx == 0:
+                        scan_orientation = "sagittal"
+            except Exception as orient_err:
+                print(f"Orientation detection failed: {orient_err}, defaulting to axial")
+        print(f"Orientation: {scan_orientation}")
+
+        # ── 4. In-memory DICOM → NIfTI ────────────────────────────────────────
+        tmp_dir = tempfile.mkdtemp()
+        nifti_tmp = os.path.join(tmp_dir, "input.nii.gz")
+        output_dir = os.path.join(tmp_dir, "seg_output")
+
         try:
-            dicom2nifti.dicom_series_to_nifti(dcm_dir, nifti_tmp, reorient_nifti=True)
+            result = convert_dicom.dicom_array_to_nifti(sorted_ds, nifti_tmp, reorient_nifti=True)
+            nifti_img = result["NII"]
         except Exception as e:
             shutil.rmtree(tmp_dir)
             return {"error": f"DICOM to NIfTI conversion failed: {e}"}
 
-        input_path = nifti_tmp
-        
-        # Load the NIfTI to get the affine for coordinate transforms later
+        # ── 5. Segment all structures in one pass ─────────────────────────────
         try:
-            nifti_img = nib.load(input_path)
-        except Exception as e:
-            shutil.rmtree(tmp_dir)
-            return {"error": f"Failed to load generated NIfTI: {e}"}
-             
-        # Detect Modality from the first DICOM (if available) OR use provided override
-        scan_modality = "CT" # Default
-        
-        # 1. Use override if provided
-        if modality:
-            scan_modality = modality
-            print(f"Using explicit modality override: {scan_modality}")
-        
-        # 2. Fallback to detection if no override
-        elif sorted_ds:
-            try:
-                mod = sorted_ds[0].get("Modality", "CT")
-                if "MR" in mod: 
-                    scan_modality = "MR"
-            except:
-                pass
-            print(f"Detected Modality from DICOM: {scan_modality}")
-        
-        try:
-            success = self._run_segmentation(input_path, output_path, structure_name, scan_modality)
-            
-            if not success:
-                 return {"found": False, "centroid": None, "message": "Structure not found."}
+            self._run_segmentation(
+                nifti_tmp, output_dir, structure_names, scan_modality,
+                fast_mode=fast_mode, fallback_to_normal=fallback_to_normal,
+            )
 
-            img = nib.load(output_path)
-            data = img.get_fdata()
-            com_voxel = center_of_mass(data)
-            
-            # Coordinate Transform: Mask Voxel -> World -> Input Voxel
-            # 1. Mask Voxel to World
-            com_world = nib.affines.apply_affine(img.affine, com_voxel)
-            
-            # 2. World to Input Voxel
-            com_input_voxel = nib.affines.apply_affine(np.linalg.inv(nifti_img.affine), com_world)
-            
-            # RLE Encode Mask
-            mask_binary = (data > 0).astype(np.uint8)
-            f = mask_binary.flatten()
-            f_padded = np.concatenate([[0], f, [0]])
-            runs = np.where(f_padded[1:] != f_padded[:-1])[0] + 1
-            runs[1::2] -= runs[::2]
-            
+            # ── 6. Process each structure's binary mask ───────────────────────
+            inv_affine = np.linalg.inv(nifti_img.affine)
+            per_structure = []
+
+            for sname in structure_names:
+                seg_path = os.path.join(output_dir, f"{sname}.nii.gz")
+                if not os.path.exists(seg_path):
+                    per_structure.append({"structure": sname, "found": False})
+                    continue
+
+                img = nib.load(seg_path)
+                data = img.get_fdata()
+                if np.sum(data) == 0:
+                    per_structure.append({"structure": sname, "found": False})
+                    continue
+
+                com_voxel = center_of_mass(data)
+                com_world = nib.affines.apply_affine(img.affine, com_voxel)
+                com_input = nib.affines.apply_affine(inv_affine, com_world)
+
+                mask_binary = (data > 0).astype(np.uint8)
+
+                # Transpose so the slice axis is always last
+                if scan_orientation == "coronal":
+                    mask_binary = np.transpose(mask_binary, (0, 2, 1))
+                    com_input = np.array([com_input[0], com_input[2], com_input[1]])
+                elif scan_orientation == "sagittal":
+                    mask_binary = np.transpose(mask_binary, (1, 2, 0))
+                    com_input = np.array([com_input[1], com_input[2], com_input[0]])
+
+                f = mask_binary.flatten()
+                f_padded = np.concatenate([[0], f, [0]])
+                runs = np.where(f_padded[1:] != f_padded[:-1])[0] + 1
+                runs[1::2] -= runs[::2]
+
+                per_structure.append({
+                    "structure": sname,
+                    "found": True,
+                    "centroid_voxel": com_input.tolist(),
+                    "mask_rle": runs.tolist(),
+                    "shape": list(mask_binary.shape),
+                })
+
             return {
-                "found": True,
-                "centroid_voxel": com_input_voxel.tolist(), 
-                "structure": structure_name,
-                "mask_rle": runs.tolist(),
-                "shape": list(mask_binary.shape),
-                "affine": img.affine.tolist(),
+                "results": per_structure,
+                "orientation": scan_orientation,
+                "affine": nifti_img.affine.tolist(),
             }
         except Exception as e:
             return {"error": str(e)}
         finally:
-            if os.path.exists(tmp_dir):
-                shutil.rmtree(tmp_dir)
+            shutil.rmtree(tmp_dir, ignore_errors=True)
 
-    def _run_segmentation(self, input_path, output_path, structure_name, modality="CT"):
+    def _run_segmentation(
+        self,
+        input_path: str,
+        output_dir: str,
+        structure_names: list[str],
+        modality: str = "CT",
+        fast_mode: bool = True,
+        fallback_to_normal: bool = True,
+    ) -> bool:
+        """Runs TotalSegmentator with ml=False so each structure gets its own binary NIfTI."""
         from totalsegmentator.python_api import totalsegmentator
         import nibabel as nib
         import numpy as np
-        import os
-        
-        # Select task based on modality
-        task_name = "total"
-        if modality == "MR":
-            task_name = "total_mr"
-            
-        print(f"Running TotalSegmentator task='{task_name}' for structure='{structure_name}'...")
-        
-        # Try Fast mode first
-        print(f"Attempting FAST segmentation for {structure_name}...")
-        try:
-            totalsegmentator(input_path, output_path, roi_subset=[structure_name], fast=True, ml=True, task=task_name)
-            if os.path.exists(output_path):
-                img = nib.load(output_path)
-                if np.sum(img.get_fdata()) > 0:
-                    print("FAST segmentation successful.")
-                    return True
-                # If existing but empty, we might want to retry normal mode?
-                # TotalSegmentator fast mode is usually adequate, but if it misses, normal might find it.
-                print("FAST segmentation produced empty mask. Retrying in NORMAL mode...")
-        except Exception as e:
-            print(f"FAST segmentation failed: {e}. Retrying in NORMAL mode...")
-            
-        # Retry Normal mode
-        try:
-            if os.path.exists(output_path): os.remove(output_path)
-            # Note: fast=False is default
-            totalsegmentator(input_path, output_path, roi_subset=[structure_name], fast=False, ml=True, task=task_name)
-            if os.path.exists(output_path):
-                img = nib.load(output_path)
-                if np.sum(img.get_fdata()) > 0:
-                    print("NORMAL segmentation successful.")
-                    return True
-        except Exception as e:
-             print(f"NORMAL segmentation failed: {e}")
-             
-        return False
+        import shutil
+
+        task_name = "total_mr" if modality == "MR" else "total"
+        print(f"Running TotalSegmentator task='{task_name}' structures={structure_names} fast={fast_mode}")
+
+        def attempt(fast: bool) -> bool:
+            label = "FAST" if fast else "NORMAL"
+            try:
+                if os.path.exists(output_dir):
+                    shutil.rmtree(output_dir)
+                os.makedirs(output_dir, exist_ok=True)
+
+                totalsegmentator(
+                    input_path, output_dir,
+                    roi_subset=structure_names,
+                    fast=fast,
+                    ml=False,
+                    task=task_name,
+                )
+
+                for sname in structure_names:
+                    seg_path = os.path.join(output_dir, f"{sname}.nii.gz")
+                    if os.path.exists(seg_path) and np.sum(nib.load(seg_path).get_fdata()) > 0:
+                        print(f"{label} segmentation found at least: {sname}")
+                        return True
+
+                print(f"{label} segmentation produced no non-empty masks.")
+            except Exception as e:
+                print(f"{label} segmentation failed: {e}")
+            return False
+
+        if fast_mode:
+            if attempt(fast=True):
+                return True
+            if fallback_to_normal:
+                print("Retrying in NORMAL (fine) mode...")
+                return attempt(fast=False)
+            return False
+
+        return attempt(fast=False)

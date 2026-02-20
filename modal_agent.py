@@ -9,6 +9,7 @@ from common import app, image
 from perception import MedGemmaPerception
 from reasoning import GemmaReasoning
 from segmentation import SegmentationAgent
+from normal_atlas import get_or_compute_atlas_entry, list_available_structures
 
 # --- FastAPI App for Frontend Orchestration ---
 
@@ -32,19 +33,24 @@ async def log_requests(request: Request, call_next):
 @web_app.post("/segment_dicom")
 async def segment_dicom_endpoint(request: Request):
     """
-    Accepts list of DICOM URLs and a structure name.
-    Downloads, stacks, and segments.
+    Accepts list of DICOM URLs and one or more structure names.
+    Downloads, stacks, and segments all in one TotalSegmentator pass.
     """
     data = await request.json()
     dicom_urls = data.get("dicom_urls", [])
-    structure = data.get("structure")
-    modality = data.get("modality") # Optional: "CT", "MR", or None
-    
-    if not dicom_urls or not structure:
-        return {"error": "Missing dicom_urls or structure"}
-        
+    structures = data.get("structures") or []
+    if not structures and data.get("structure"):
+        structures = [data["structure"]]
+    modality = data.get("modality")
+    orientation = data.get("orientation")
+
+    if not dicom_urls or not structures:
+        return {"error": "Missing dicom_urls or structures"}
+
     model = SegmentationAgent()
-    return model.get_centroid_from_dicom_urls.remote(dicom_urls, structure, modality)
+    return model.get_centroid_from_dicom_urls.remote(
+        dicom_urls, structures, modality, orientation=orientation
+    )
 
 @web_app.post("/check-window")
 async def check_window_endpoint(request: Request):
@@ -99,15 +105,29 @@ async def detect_modality_endpoint(request: Request):
 async def summary_multi_endpoint(request: Request):
     data = await request.json()
     model = MedGemmaPerception()
-    imgs = data.get("images_base64")
     text = data.get("text")
     dicom_urls = data.get("dicom_urls") # Optional
     
-    if not imgs and not dicom_urls:
-        return {"error": "Missing images_base64 or dicom_urls"}
+    if not dicom_urls:
+        return {"error": "Missing dicom_urls"}
         
-    summary = model.summarize.remote(images_base64=imgs, task_context=text, dicom_urls=dicom_urls)
+    summary = model.summarize.remote(task_context=text, dicom_urls=dicom_urls)
     return {"summary": summary}
+
+
+@web_app.get("/normal-atlas/{structure}")
+async def normal_atlas_endpoint(structure: str, orientation: str = "axial"):
+    """
+    Return pre-segmented normal CT data for a given structure.
+    If not cached, segments the normal CT on-demand (first call is slower).
+    """
+    return get_or_compute_atlas_entry(structure, orientation)
+
+
+@web_app.get("/normal-atlas")
+async def normal_atlas_list_endpoint(orientation: str = "axial"):
+    """List all structures that have cached atlas data."""
+    return {"structures": list_available_structures(orientation)}
 
 
 @app.function(image=image, secrets=[modal.Secret.from_name("huggingface-secret")], timeout=600)
