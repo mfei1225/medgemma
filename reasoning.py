@@ -222,7 +222,7 @@ RULES:
 4. If the user mentions a pathology, map to the relevant anatomical structure(s).
    Example: "right lung opacity" → ["lung_upper_lobe_right", "lung_middle_lobe_right", "lung_lower_lobe_right"]
    Example: "liver lesion" → ["liver"]
-5. If laterality is unspecified and required, default to RIGHT side.
+5. If laterality is unspecified but multiple sides exist, return ALL sides (both left and right).
 6. If NO relevant structure matches, return an empty array.
 7. Maximum 5 structures per request.
 8. Every structure in the output MUST be from the valid list above. Do not invent names.

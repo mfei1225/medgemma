@@ -1,7 +1,7 @@
 import modal
 import os
 from typing import Optional, Dict, Any, List
-from common import app, image, model_cache, get_modality, get_valid_structures_for_modality
+from common import app, image, model_cache, get_modality, get_valid_structures_for_modality, clean_url
 
 @app.cls(
     image=image,
@@ -72,7 +72,7 @@ class SegmentationAgent:
         async def fetch_all(urls):
             async with httpx.AsyncClient(timeout=15) as client:
                 async def fetch(url, index):
-                    clean = url.replace("dicomweb:", "") if url.startswith("dicomweb:") else url
+                    clean = clean_url(url)
                     try:
                         resp = await client.get(clean)
                         if resp.status_code != 200:

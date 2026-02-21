@@ -100,6 +100,12 @@ def get_valid_structures_for_modality(modality: str) -> list:
     return CT_STRUCTURES
 
 
+def clean_url(url: str) -> str:
+    """Strips frontend-specific prefixes like 'wadouri:' or 'dicomweb:'."""
+    if not url: return ""
+    return re.sub(r"^(wadouri:|dicomweb:)", "", url)
+
+
 def extract_first_json(text: str):
     # 1. Try markdown code block first
     code_block = re.search(r"```(?:json)?\s*(.*?)\s*```", text, re.DOTALL)

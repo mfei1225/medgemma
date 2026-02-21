@@ -1,7 +1,7 @@
 import modal
 import os
 from typing import Optional, Dict, Any, List
-from common import app, image, model_cache, extract_first_json, get_modality
+from common import app, image, model_cache, extract_first_json, get_modality, clean_url
 
 PERCEPTION_GPU = "A10G"
 #PERCEPTION_GPU = "A100-40GB" 
@@ -85,7 +85,7 @@ class MedGemmaPerception:
 
         def fetch(url):
             try:
-                clean = url.replace("dicomweb:", "")
+                clean = clean_url(url)
                 r = requests.get(clean, timeout=10)
                 if r.status_code == 200:
                     data = r.content
@@ -164,7 +164,7 @@ class MedGemmaPerception:
         try:
             import requests, pydicom, io
             import numpy as np
-            url = dicom_urls[0].replace("dicomweb:", "")
+            url = clean_url(dicom_urls[0])
             r = requests.get(url, timeout=5)
             if r.status_code == 200:
                 ds = pydicom.dcmread(io.BytesIO(r.content))
