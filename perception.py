@@ -3,15 +3,16 @@ import os
 from typing import Optional, Dict, Any, List
 from common import app, image, model_cache, extract_first_json, get_modality, clean_url
 
-PERCEPTION_GPU = "A10G"
-#PERCEPTION_GPU = "A100-40GB" 
+#PERCEPTION_GPU = "A10G"
+PERCEPTION_GPU = "A100-40GB" 
+
 @app.cls(
     image=image,
     gpu=PERCEPTION_GPU,
     volumes={"/cache": model_cache},
     secrets=[modal.Secret.from_name("huggingface-secret")],
     scaledown_window=300,
-    # keep_warm=1,
+    #keep_warm=1,
     cpu=4,
     memory=16384,
 )

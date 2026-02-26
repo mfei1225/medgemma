@@ -33,6 +33,13 @@ CORONAL_CT_END = 165
 CORONAL_CT_WW = 350
 CORONAL_CT_WC = 1074
 
+HEAD_CT_PREFIX = "https://images.pacsbin.com/dicom/production/Zk7qRUbE5O_1.2.840.113619.2.437.3.2299157841.358.1663827198.554/"
+HEAD_CT_SUFFIX = ".dcm.gz"
+HEAD_CT_START = 1
+HEAD_CT_END = 269
+HEAD_CT_WW = 150
+HEAD_CT_WC = 1059
+
 
 def _build_urls(prefix: str, suffix: str, start: int, end: int) -> List[str]:
     return [
@@ -50,6 +57,9 @@ NORMAL_CT_DICOMWEB_URLS = _build_dicomweb_urls(NORMAL_CT_DICOM_URLS)
 
 CORONAL_CT_DICOM_URLS = _build_urls(CORONAL_CT_PREFIX, CORONAL_CT_SUFFIX, CORONAL_CT_START, CORONAL_CT_END)
 CORONAL_CT_DICOMWEB_URLS = _build_dicomweb_urls(CORONAL_CT_DICOM_URLS)
+
+HEAD_CT_DICOM_URLS = _build_urls(HEAD_CT_PREFIX, HEAD_CT_SUFFIX, HEAD_CT_START, HEAD_CT_END)
+HEAD_CT_DICOMWEB_URLS = _build_dicomweb_urls(HEAD_CT_DICOM_URLS)
 
 # ── Atlas store (loaded from JSON on import) ──────────────────────────────────
 
@@ -101,10 +111,24 @@ def get_or_compute_atlas_entry(structure: str, orientation: str = "axial") -> Di
         print(f"[normal_atlas] On-demand segmentation for: {structure} ({orientation})")
         agent = SegmentationAgent()
         
-        dicom_urls = CORONAL_CT_DICOM_URLS if orientation == "coronal" else NORMAL_CT_DICOM_URLS
-        dicomweb_urls = CORONAL_CT_DICOMWEB_URLS if orientation == "coronal" else NORMAL_CT_DICOMWEB_URLS
-        ww = CORONAL_CT_WW if orientation == "coronal" else NORMAL_CT_WW
-        wc = CORONAL_CT_WC if orientation == "coronal" else NORMAL_CT_WC
+        # Determine if structure is primarily a head structure
+        head_structures = {"brain", "skull", "face", "eye_left", "eye_right"} # Plus any others that might be queried standalone
+        
+        if structure in head_structures or "brain" in structure or "skull" in structure:
+            dicom_urls = HEAD_CT_DICOM_URLS
+            dicomweb_urls = HEAD_CT_DICOMWEB_URLS
+            ww = HEAD_CT_WW
+            wc = HEAD_CT_WC
+        elif orientation == "coronal":
+            dicom_urls = CORONAL_CT_DICOM_URLS
+            dicomweb_urls = CORONAL_CT_DICOMWEB_URLS
+            ww = CORONAL_CT_WW
+            wc = CORONAL_CT_WC
+        else:
+            dicom_urls = NORMAL_CT_DICOM_URLS
+            dicomweb_urls = NORMAL_CT_DICOMWEB_URLS
+            ww = NORMAL_CT_WW
+            wc = NORMAL_CT_WC
 
         result = agent.get_centroid_from_dicom_urls.remote(
             dicom_urls, [structure]

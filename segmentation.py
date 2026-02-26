@@ -5,11 +5,16 @@ from common import app, image, model_cache, get_modality, get_valid_structures_f
 
 @app.cls(
     image=image,
-    gpu="A10G",
+    gpu="H100",
+    #gpu="A10G",
     volumes={"/cache": model_cache},
-    secrets=[modal.Secret.from_name("huggingface-secret")],
-    timeout=600,
+    secrets=[
+        modal.Secret.from_name("huggingface-secret"),
+        modal.Secret.from_name("totalsegmentator-secret")
+    ],
+    timeout=3600,
     scaledown_window=300,
+    #keep_warm =1,
     cpu=4,
     memory=16384,
 )
@@ -147,12 +152,19 @@ class SegmentationAgent:
             shutil.rmtree(tmp_dir)
             return {"error": f"DICOM to NIfTI conversion failed: {e}"}
 
-        # ── 5. Segment all structures in one pass ─────────────────────────────
+        # ── 5. Segment all structures organized by tasks ──────────────────────
         try:
-            self._run_segmentation(
-                nifti_tmp, output_dir, structure_names, scan_modality,
-                fast_mode=fast_mode, fallback_to_normal=fallback_to_normal,
-            )
+            import sys
+            sys.path.append(os.path.dirname(__file__))
+            from totalseg_tasks import group_structures_by_task
+            
+            task_groups = group_structures_by_task(structure_names, scan_modality)
+            
+            for task_name, items in task_groups.items():
+                self._run_segmentation(
+                    nifti_tmp, output_dir, items, task_name=task_name,
+                    fast_mode=fast_mode, fallback_to_normal=fallback_to_normal,
+                )
 
             # ── 6. Process each structure's binary mask ───────────────────────
             inv_affine = np.linalg.inv(nifti_img.affine)
@@ -212,7 +224,7 @@ class SegmentationAgent:
         input_path: str,
         output_dir: str,
         structure_names: list[str],
-        modality: str = "CT",
+        task_name: str,
         fast_mode: bool = True,
         fallback_to_normal: bool = True,
     ) -> bool:
@@ -222,19 +234,36 @@ class SegmentationAgent:
         import numpy as np
         import shutil
 
-        task_name = "total_mr" if modality == "MR" else "total"
         print(f"Running TotalSegmentator task='{task_name}' structures={structure_names} fast={fast_mode}")
 
         def attempt(fast: bool) -> bool:
             label = "FAST" if fast else "NORMAL"
+            
+            # Optionally setup license from loaded secret
+            import os
+            import subprocess
+            license_key = os.environ.get("TOTALSEG_LICENSE")
+            if license_key:
+                try:
+                    subprocess.run(["totalseg_set_license", "-l", license_key], check=True, capture_output=True)
+                except Exception as e:
+                    print(f"Warning: Failed to set Totalsegmentator license: {e}")
+            
             try:
-                if os.path.exists(output_dir):
-                    shutil.rmtree(output_dir)
                 os.makedirs(output_dir, exist_ok=True)
+                
+                # Clear ONLY the targeted structures so we don't wipe other tasks' outputs during retries
+                for sname in structure_names:
+                    p = os.path.join(output_dir, f"{sname}.nii.gz")
+                    if os.path.exists(p):
+                        os.remove(p)
 
+                # TotalSegmentator only allows roi_subset for the base tasks
+                use_roi = structure_names if task_name in ["total", "total_mr"] else None
+                
                 totalsegmentator(
                     input_path, output_dir,
-                    roi_subset=structure_names,
+                    roi_subset=use_roi,
                     fast=fast,
                     ml=False,
                     task=task_name,

@@ -18,10 +18,13 @@ from normal_atlas import (
     NORMAL_CT_DICOMWEB_URLS,
     NORMAL_CT_WW,
     NORMAL_CT_WC,
-    CORONAL_CT_DICOM_URLS,
     CORONAL_CT_DICOMWEB_URLS,
     CORONAL_CT_WW,
     CORONAL_CT_WC,
+    HEAD_CT_DICOM_URLS,
+    HEAD_CT_DICOMWEB_URLS,
+    HEAD_CT_WW,
+    HEAD_CT_WC,
 )
 
 ATLAS_OUTPUT_FILE = "normal_atlas_data.json"
@@ -35,6 +38,7 @@ def main():
     orientations = [
         ("axial", NORMAL_CT_DICOM_URLS, NORMAL_CT_DICOMWEB_URLS, NORMAL_CT_WW, NORMAL_CT_WC),
         ("coronal", CORONAL_CT_DICOM_URLS, CORONAL_CT_DICOMWEB_URLS, CORONAL_CT_WW, CORONAL_CT_WC),
+        ("axial", HEAD_CT_DICOM_URLS, HEAD_CT_DICOMWEB_URLS, HEAD_CT_WW, HEAD_CT_WC),
     ]
 
     for orn, dicom_urls, dicomweb_urls, ww, wc in orientations:

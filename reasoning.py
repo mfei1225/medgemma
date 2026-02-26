@@ -5,15 +5,16 @@ from typing import Optional, Dict, Any, List
 from common import app, image, model_cache, extract_first_json, VALID_STRUCTURES, get_modality, get_valid_structures_for_modality
 
 # Reasoning (27B) needs 80GB A100 to avoid loading OOM (failed on 40GB).
-REASONING_GPU = "A100-80GB"
-#REASONING_GPU = "H100" 
+#REASONING_GPU = "A100-80GB"
+REASONING_GPU = "H100" 
+
 @app.cls(
     image=image,
     gpu=REASONING_GPU,
     volumes={"/cache": model_cache},
     secrets=[modal.Secret.from_name("huggingface-secret")],
     scaledown_window=300,
-    # keep_warm=1,          # UNCOMMENT FOR DEMOS: Always keep 1 container warm to avoid cold starts
+    #keep_warm=1,          # UNCOMMENT FOR DEMOS: Always keep 1 container warm to avoid cold starts
     cpu=8,
     memory=32768, # Increased to 32GB for 27B model loading
 )
@@ -226,11 +227,14 @@ RULES:
 6. If NO relevant structure matches, return an empty array.
 7. Maximum 5 structures per request.
 8. Every structure in the output MUST be from the valid list above. Do not invent names.
+9. If the user asks for a structure that is NOT in the valid list (e.g. "appendix", "gallbladder" in some cases, "tonsils"), but you return a close substitute from the valid list (e.g. "cecum"/"colon", "liver", "pharynx" etc.), you MUST provide a "relative_location" string explaining where the requested structure is relative to the substitute structure you selected. 
+10. If you did not have to make a substitution, "relative_location" should be null.
 
 OUTPUT JSON ONLY:
 {{
   "thought": "brief reasoning",
-  "structures": ["structure_1", "structure_2"]
+  "structures": ["structure_1", "structure_2"],
+  "relative_location": "The requested structure X is located relative to chosen structure Y..." (or null)
 }}
 """
         messages = [
@@ -262,10 +266,14 @@ OUTPUT JSON ONLY:
                     structures = [parsed["structure"]]
                 # Filter to only valid names
                 structures = [s for s in structures if s in VALID_STRUCTURES]
-                return {"thought": parsed.get("thought", ""), "structures": structures}
-            return {"thought": generated_text, "structures": []}
+                return {
+                    "thought": parsed.get("thought", ""),
+                    "structures": structures,
+                    "relative_location": parsed.get("relative_location", None)
+                }
+            return {"thought": generated_text, "structures": [], "relative_location": None}
         except:
-            return {"thought": "Failed to parse", "structures": []}
+            return {"thought": "Failed to parse", "structures": [], "relative_location": None}
 
     @modal.method()
     def route_intent(self, message: str, history: list = []) -> Dict[str, Any]:
